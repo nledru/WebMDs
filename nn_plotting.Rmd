@@ -1,0 +1,124 @@
+---
+title: "Neural Net Plotting"
+date: "`r Sys.Date()`"
+output:
+  rmdformats::readthedown:
+    highlight: kate
+    number_sections: TRUE
+    code_folding: show
+    code_download: TRUE
+---
+
+# Preliminaries 
+
+The purpose of this script is to plot the results from our neural net
+
+```{r setup, include=FALSE}
+
+library(knitr); library(rmdformats)
+
+opts_chunk$set(echo=TRUE,
+               cache=FALSE,
+               prompt=FALSE,
+               tidy=FALSE,
+               comment=NA,
+               message=FALSE,
+               warning=FALSE)
+opts_knit$set(width=75)
+
+
+```
+
+Set working directory. Load packages. Replace "data" with local name for data directory.
+
+```{r load_packages, message=FALSE}
+data_dir <- "data"
+
+library(here)
+library(survey)
+library(tidyverse)
+```
+
+## Load data
+
+```{r load_nn_data}
+
+data_tidy <- read.csv(here(data_dir, "mseresults.csv"))[-9, ]
+colnames(data_tidy) <- c("trial_num", "all_vars", "no_h_contrl_race", "no_aweekend_amonth")
+
+data_long <- data_tidy %>%
+  pivot_longer(2:4, names_to = "Model_Vars") %>%
+  mutate(Model_Vars = factor(Model_Vars, ordered = TRUE, levels = c("no_h_contrl_race", "all_vars", "no_aweekend_amonth")))
+
+data_t_test <- read.csv(here(data_dir, "mseresults.csv"))[9, ]
+colnames(data_t_test) <- c("test", "all_vars", "no_h_contrl_race", "no_aweekend_amonth")
+
+```
+
+# Plot MSE results 
+
+```{r plot_mse}
+
+ggplot(data_long, aes(Model_Vars, value, group = trial_num)) +
+  geom_point() + 
+  geom_line() + 
+  scale_x_discrete(labels = c("Removing Hospital Control \nand Race", "All Variables", "Removing weekend status \nand month admission")) +
+  annotate("text", x = 1.5, y = .195, vjust = 0, size = 3,
+           label = paste0("pairwise t-test \np = ", round(data_t_test$no_h_contrl_race, 6))) +
+  annotate("text", x = 2.5, y = .195, vjust = 0, size = 3,
+           label = paste0("pairwise t-test \np = ", round(data_t_test$no_aweekend_amonth, 6))) +
+  scale_y_continuous(limits = c(0.14, 0.20)) +
+  labs(x = "Model Variables", y = "MSE") +
+  theme_bw()
+
+
+```
+
+
+
+```{r test}
+
+mydata <- data.frame(ID = c(1, 2, 3, 5, 6, 7, 9, 11, 12, 13),          #patient ID
+                     t1 = c(37, 66, 28, 60, 44, 24, 47, 44, 33, 47),    #evaluation before
+                     t4 = c(33, 45, 27, 39, 24, 29, 24, 37, 27, 42),    #evaluation after
+                     sexe = c(1, 2, 2, 1, 1, 1, 2, 2, 2, 1))      
+
+pval <- wilcox.test(x = mydata$t1,y = mydata$t4, paired = T,exact = F)$p.value %>% round(2)
+
+df <- mydata %>% 
+  pivot_longer(2:3,names_to = "Time") %>% # Pivot into long-format
+  mutate(sexe = as.factor(sexe),
+         Time = as.factor(Time)) # Make factors 
+
+ggplot(df,aes(Time,value,color = sexe,group = ID)) + 
+  geom_point() + 
+  geom_line() + 
+  stat_summary(inherit.aes = F,aes(Time,value),
+    geom = "point", fun = "median", col = "red", 
+    size = 3, shape = 24,fill = "red"
+  ) +
+  annotate("text", x = 1.7, y = 60, label = paste('P-Value is',pval)) + 
+  coord_cartesian(xlim = c(1.4,1.6)) +
+  theme_bw()
+
+```
+
+
+
+# Plot results
+
+```{r plot_violins}
+
+ggplot(data_tidy, aes(x = for_profit, y = ccr_nis)) + 
+  geom_violin(aes(fill=for_profit)) +
+  annotate("text", x = 2, y = 1.7, vjust = 0, size = 5,
+           label = "wilcoxon test p < 2.2 e -16") +
+  theme_bw() +
+  scale_fill_manual(values = c("lightblue2", "lightblue4"), 
+                    name = "For Profit Status") + 
+  labs(x = "Hospital For Profit Status",
+       y = "Cost-to-Charge Ratio")
+  
+
+```
+

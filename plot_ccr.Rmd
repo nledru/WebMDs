@@ -1,0 +1,86 @@
+---
+title: "Neural Net Plotting"
+date: "`r Sys.Date()`"
+output:
+  rmdformats::readthedown:
+    highlight: kate
+    number_sections: TRUE
+    code_folding: show
+    code_download: TRUE
+---
+
+# Preliminaries 
+
+The purpose of this script is to plot the results from our neural net
+
+```{r setup, include=FALSE}
+
+library(knitr); library(rmdformats)
+
+opts_chunk$set(echo=TRUE,
+               cache=FALSE,
+               prompt=FALSE,
+               tidy=FALSE,
+               comment=NA,
+               message=FALSE,
+               warning=FALSE)
+opts_knit$set(width=75)
+
+
+```
+
+Set working directory. Load packages. Replace "data" with local name for data directory.
+
+```{r load_packages, message=FALSE}
+data_dir <- "data"
+
+library(here)
+library(survey)
+library(tidyverse)
+```
+
+## Load data
+
+```{r load_nn_data}
+
+data_tidy <- read.csv(here(data_dir, "hosp_control_ccr.csv")) %>%
+  mutate(for_profit = factor(ifelse(h_contrl==3, "Yes", "No")))
+
+```
+
+# Statistics
+
+```{r ttest}
+options(survey.lonely.psu="adjust") # assists with survey design when strata have minimal samples
+
+design1 <- svydesign(id = ~hosp_nis, 
+                     strata = ~nis_stratum,
+                     weights = ~discwt, 
+                     nest = TRUE,
+                     survey.lonely.psu = "adjust", 
+                     data = data_tidy)
+
+ranksum_results <- svyranktest(ccr_nis ~ for_profit, design = design1, test = "wilcoxon")
+
+ranksum_results
+
+```
+
+
+
+# Plot results
+
+```{r plot_violins}
+
+ggplot(data_tidy, aes(x = for_profit, y = ccr_nis)) + 
+  geom_violin(aes(fill=for_profit), draw_quantiles = c(0.25, 0.5, 0.75)) +
+  annotate("text", x = 2, y = 1.7, vjust = 0, size = 5,
+           label = "wilcoxon test p < 2.2 e -16") +
+  theme_bw() +
+  scale_fill_manual(values = c("lightblue2", "lightblue4"), 
+                    name = "For Profit Status") + 
+  labs(x = "Hospital For Profit Status",
+       y = "Cost-to-Charge Ratio")
+
+```
+

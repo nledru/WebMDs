@@ -1,0 +1,68 @@
+---
+title: "Clean Data"
+author: "Jessica Scarborough"
+date: "1/13/2022"
+output: html_document
+---
+
+
+# Packages and System Set Up
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+We'll start by loading a couple basic packages. `here` is used to easily set your working directory. You'll need to replace `data_dir`'s assignment with whatever you've titled your data directory. `tidyverse` is always loaded last to avoid conflicts. 
+
+```{r packages, message=FALSE}
+
+data_dir <- "data"
+
+library(here)
+library(tidyverse)
+
+```
+
+
+# Read in Data
+
+
+```{r read_data, message=FALSE}
+
+# core_2019 <- read_csv(here(data_dir, "NIS_2019_Core.csv"))
+# core_2018 <- read_csv(here(data_dir, "NIS_2018_Core.csv"))
+# core_2017 <- read_csv(here(data_dir, "NIS_2017_Core.csv"))
+# core_2016 <- read_csv(here(data_dir, "NIS_2016_Core.csv"))
+# 
+# severity_2019 <- read_csv(here(data_dir, "NIS_2019_Severity.csv"))
+# severity_2018 <- read_csv(here(data_dir, "NIS_2018_Severity.csv"))
+# severity_2017 <- read_csv(here(data_dir, "NIS_2017_Severity.csv"))
+# severity_2016 <- read_csv(here(data_dir, "NIS_2016_Severity.csv"))
+# 
+# hospital_2019 <- read_csv(here(data_dir, "NIS_2019_Hospital.csv"))
+# hospital_2018 <- read_csv(here(data_dir, "NIS_2018_Hospital.csv"))
+# hospital_2017 <- read_csv(here(data_dir, "NIS_2017_Hospital.csv"))
+# hospital_2016 <- read_csv(here(data_dir, "NIS_2016_Hospital.csv"))
+
+cost_2019 <- read_csv(here(data_dir, "cc2019NIS.csv"))
+cost_2018 <- read_csv(here(data_dir, "cc2018NIS.csv"))
+cost_2017 <- read_csv(here(data_dir, "cc2017NIS.csv"))
+cost_2016 <- read_csv(here(data_dir, "cc2016NIS.csv"))
+
+dx_data <- read_table(here(data_dir, "dx_data.txt")) #something is wrong with this upload, I'll look at it later
+
+```
+
+
+## Quick visualization
+
+
+```{r quick_subset}
+# 
+# core_2019_subset <- core_2019 %>% slice_sample(n = 1000) # for easy viewing
+# # r package for converting ICD10 codes
+# severity_2019_subset <- severity_2019 %>% slice_sample(n = 1000)
+# hospital_2019_subset <- hospital_2019 %>% slice_sample(n = 1000)
+cost_2019_subset <- cost_2019 %>% slice_sample(n = 1000)
+head(cost_2019_subset)
+```

@@ -1,0 +1,706 @@
+---
+title: "regression_nis"
+date: "`r Sys.Date()`"
+output:
+  rmdformats::readthedown:
+    highlight: kate
+    number_sections: TRUE
+    code_folding: show
+    code_download: TRUE
+---
+
+# Preliminaries 
+
+The purpose of this script is to set up a master dataset with which to filter a particular patient population based on ICD-10 codes and then set up input variables for linear/logistic regression.
+
+```{r setup, include=FALSE}
+
+library(knitr); library(rmdformats)
+
+opts_chunk$set(echo=TRUE,
+               cache=FALSE,
+               prompt=FALSE,
+               tidy=FALSE,
+               comment=NA,
+               message=FALSE,
+               warning=FALSE)
+opts_knit$set(width=75)
+
+
+```
+
+Set working directory. Load packages. Replace "data" with local name for data directory.
+
+```{r load_packages, message=FALSE}
+data_dir <- "data"
+
+library(Hmisc)
+library(mice)
+library(knitr)
+library(GGally)
+library(naniar)
+library(here)
+library(patchwork)
+library(tableone)
+library(caret)
+library(iNZightRegression)
+library(survey)
+library(yarrr)
+library(gtsummary)
+library(tidyverse)
+```
+
+# Data Management
+
+## Load Data
+
+```{r read_data}
+
+regression_data <- readRDS(here(data_dir, "regression_data_smm_nonimputed.rds"))
+
+```
+
+## Clean data types
+
+Code demographic variables and other info for input into linear regression models. We're going to use a variety of predictors to predict total cost (`totchg`) of the hospital stay for patients diagnosed with severe maternal mortality, accounting for a weighted survey design using the `discwt` variable. 
+
+Below, we'll use `mutate` and `case_when` to create new factor variables.
+
+```{r convert_cats}
+
+regression_data_smm <- regression_data %>%
+  mutate(key_nis = as.character(key_nis),
+         age_cat = factor(case_when(age < 18 ~ "0-17",
+                                    age >= 18 & age < 30 ~ "18-29",
+                                    age >= 30 & age < 45 ~ "30-44", 
+                                    age >= 45 & age < 60 ~ "45-59", 
+                                    age >= 60 ~ "60+"), ordered = TRUE),
+         race_cat = factor(case_when(race == 1 ~ "a_white", # forcing a to be first, so white will be reference
+                                     race == 2 ~ "b_black", 
+                                     race == 3 ~ "c_hispanic", 
+                                     race == 4 ~ "d_asian/pacific island", 
+                                     race == 5 ~ "e_native american", 
+                                     race == 6 ~ "f_other")),
+         aprdrg_risk_mortality = factor(aprdrg_risk_mortality, ordered = TRUE), # can't be factor for lm below
+         aprdrg_risk_mortality = factor(case_when(aprdrg_risk_mortality == 0 |
+                                             aprdrg_risk_mortality == 1 ~ "0-1", 
+                                           aprdrg_risk_mortality == 2 ~ "2", 
+                                           aprdrg_risk_mortality == 3 ~ "3", 
+                                           aprdrg_risk_mortality == 4 ~ "4"), ordered = TRUE),
+         aprdrg_severity = factor(case_when(aprdrg_severity == 0 |
+                                              aprdrg_severity == 1 ~ "0-1", 
+                                            aprdrg_severity == 2 ~ "2", 
+                                            aprdrg_severity == 3 ~ "3", 
+                                            aprdrg_severity == 4 ~ "4"), ordered = TRUE), 
+         aprdrg_severity = factor(aprdrg_severity, ordered = TRUE), # should be factor though,
+                                                                      # we'll probably update the model 
+                                                                      # choice if we go with this
+         payer_cat = factor(case_when(pay1 == 1 ~ "c_medicare", # forcing a to be first, so private will be ref
+                                      pay1 == 2 ~ "d_medicaid", 
+                                      pay1 == 3 ~ "a_private", 
+                                      pay1 == 4 ~ "b_self", 
+                                      pay1 == 5 ~ "e_no charge",
+                                      pay1 == 6 ~ "f_other")),
+         h_contrl_cat = factor(case_when(h_contrl == 1 ~ "b_govt", # private, non profit is reference
+                                         h_contrl == 2 ~ "a_pvt_non_prof", 
+                                         h_contrl == 3 ~ "c_pvt_for_prof")),
+         zipinc_qrtl = factor(zipinc_qrtl, ordered = TRUE), # convert to ordinal
+         los_cat = factor(case_when(los >= 0 & los <= 1 ~ "0-1", 
+                             los == 2 ~ "2", 
+                             los == 3 ~ "3", 
+                             los >= 4 & los <= 5 ~ "4-5", 
+                             los >= 6 & los <= 8 ~ "6-8", 
+                             los >= 9 & los <= 12 ~ "9-12", 
+                             los >= 13 & los <= 20 ~ "13-20", 
+                             los >= 21 ~ "21+"), ordered = TRUE, 
+                          levels = c("0-1", "2", "3", "4-5", "6-8", "9-12", "13-20", "21+"))) %>%
+  mutate_at(vars(matches("cmr_")), factor) %>%
+  select(-c(age, race, pay1, h_contrl, los)) # remove original variables when we altered their categories
+
+```
+
+## Missingness
+
+### Assess missing values
+
+Below, we use `gg_miss_var` to visualize how many samples are missing for each of the variables in our dataset. As promised, the `race` variable has the greatest number of missing values, according to the two plots below. After that, `zipinc_qrtl`, `totchg`, `pl_nchs`, `elective`, `payer_cat`, `amonth`, and `age_cat` have a few missing values each. 
+
+Next, the second plot, produced using `gg_miss_upset` allows us to see how many samples have missing values for each combination of the variables. Most samples are only missing one variable, and just a few samples are missing multiple. We'll go forward with imputation. 
+
+```{r view_missingness}
+
+gg_miss_var(regression_data_smm)
+
+gg_miss_upset(regression_data_smm)
+
+```
+
+Because `totchg` is our outcome variable, we will not impute those data. Let's filter our `regression_data_smm` for complete cases in this variable before moving forward with imputation. 
+
+```{r filter_totchg}
+
+regression_data_smm <- regression_data_smm %>%
+  filter(complete.cases(totchg))
+
+```
+
+
+### Impute `race_cat`, `zipinc_qrtl`, `pl_nchs`, `elective`, `payer_cat`, `amonth`, and `age_cat`
+
+Because the data are likely not Missing Completely at Random (MCAR), removing all samples with `NA` values may cause our model to be biased. We will move forward with imputation using the `mice` package. 
+
+This code is based on the tutorial [here](https://www.r-bloggers.com/2016/06/handling-missing-data-with-mice-package-a-simple-approach/).
+
+```{r impute}
+
+init <- mice(regression_data_smm, maxit=0)
+meth = init$method
+predM = init$predictorMatrix
+
+# remove variables we think will be less useful (to cut down on imputation time)
+cmr_codes <- colnames(regression_data_smm)[grep("cmr_", colnames(regression_data_smm))]
+keep_var <- c("i10_ndx", "los_cat", "pclass_orproc", "pl_nchs", "totchg", 
+              "elective", "zipinc_qrtl", "aprdrg_risk_mortality", 
+              "aprdrg_severity", "age_cat", "race_cat", "payer_cat", 
+              "h_contrl_cat", cmr_codes)
+remove_var <- colnames(regression_data_smm)[!(colnames(regression_data_smm) %in% keep_var)]
+
+predM[, remove_var] = 0
+
+# specify methods for imputing missing values
+# "polyreg" for unordered categorical
+# "polr" for ordered categorical 
+# based on cran documentation for `mice` function in `mice` package:
+# https://search.r-project.org/CRAN/refmans/mice/html/mice.html
+meth[c("race_cat")]="polyreg" 
+meth[c("pl_nchs")]="polyreg" 
+meth[c("payer_cat")]="polyreg" 
+meth[c("amonth")]="polyreg" 
+
+meth[c("elective")]="logreg"
+
+meth[c("zipinc_qrtl")]="polr" 
+meth[c("age_cat")]="polr" 
+
+# run imputation
+# this should take ~ 20 minutes
+
+# uncomment to re-run imputation
+# set.seed(0)
+# imputed = mice(regression_data_smm, method=meth, predictorMatrix=predM, m=5)
+# regression_data_smm_imputed <- complete(imputed)
+# saveRDS(regression_data_smm_imputed, here(data_dir, "regression_data_smm_imputed.rds"))
+
+# uncomment to read in results
+regression_data_smm_imputed <- readRDS(here(data_dir, "regression_data_smm_imputed.rds"))
+
+
+```
+
+## Describe data
+
+We'll use the `describe` function in the `Hmisc` package to take a quick look at all of our variables here. We'll make sure that each variable is encoded with the appropriate datatype and assess if any of them should be removed. 
+
+Some of the `cmr` variables are very infrequent. It may be best to not include those predictors which occur in less than 1% of the samples. This will reduce the chance that differences in training/testing sets will influence model performance. 
+
+```{r describe_regr_data}
+
+data_describe <- Hmisc::describe(regression_data_smm_imputed)
+
+html(data_describe)
+
+```
+
+
+## Remove infrequent discrete variables
+
+### Binary
+
+For binary variables, we're going to filter through each variable and determine if one of the groups is present in less than 1% of the samples. Those will be removed.
+
+```{r show_rare_factors}
+
+vars_bin_vec <- c()
+freq_bin_min_vec <- c()
+
+for (i in 1:length(data_describe)){
+  var <- data_describe[[i]]$descript
+  if(is.factor(regression_data_smm_imputed[, var])){
+    if(length(data_describe[[i]]$values$frequency) == 2){
+      vars_bin_vec <- c(vars_bin_vec, var)
+      freqs <- data_describe[[i]]$values$frequency
+      freq_min <- min(freqs) / sum(freqs)
+      freq_bin_min_vec <- c(freq_bin_min_vec, freq_min)
+    }
+  }
+}
+
+freq_min_df <- data.frame(var = vars_bin_vec, freq = freq_bin_min_vec) %>%
+  mutate(remove = ifelse(freq >= 1 | freq <= 0.01, 1, 0))
+
+remove_vars <- freq_min_df %>% filter(remove == 1) %>% pull(var)
+
+print(remove_vars)
+
+```
+
+### Multi-categorical  
+
+Based on the description of the dataset above, we're also going to remove the following variables because they're so skewed between categories that they will not be informative to the models (and may create bias issues between training/testing splits). 
+
+
+```{r add_remove_vars}
+
+remove_vars <- c(remove_vars, "hcup_ed", "dispuniform", "i10_injury", "i10_serviceline", "mdc", "mdc_nopoa", "tran_in", "tran_out", "i10_delivery", "female", "cmr_dementia", "dispuniform")
+
+```
+
+```{r remove_infreq}
+
+regression_data_tidy <- regression_data_smm_imputed %>%
+  select(-all_of(remove_vars))
+
+```
+
+
+# Data visualization
+
+## Assess outcome distribution
+
+We'll look at our only outcome variable, `totchg`, to determine whether or not it should be transformed in order to meet the assumptions of a linear model. Below we'll look at the distribution of the untransformed `totchg` variable overlayed by a uniform distribution with the same mean and standard deviation as `totchg`. We can see that this variable is highly right-skewed. 
+
+Next, we'll assess the same plot, after log-transforming the variable, `totchg_log`.  
+
+```{r viz_continuous_var}
+
+unique_values <- length(unique(regression_data_tidy$totchg)) # for plot subtitle
+bin_w1 <- 50000
+res1 <- mosaic::fav_stats(regression_data_tidy$totchg)
+hist_plot_totchg <-  ggplot(regression_data_tidy, aes(x = totchg)) +
+  geom_histogram(binwidth = bin_w1, color = "white", fill = "slategray2") + 
+  stat_function( # Plot Normal curve
+    fun = function(x) dnorm(x, mean = res1$mean,
+                            sd = res1$sd) * 
+      res1$n * bin_w1,
+    col = "skyblue4", size = 1.5) + 
+  labs(title = "`totchg` Distribution",
+       subtitle = paste0(unique_values, " unique values"),
+       x = "Total Charge ($)", y = "Count") + 
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+
+
+regression_data_tidy$totchg_log <- log(regression_data_tidy$totchg)
+
+unique_values <- length(unique(regression_data_tidy$totchg_log)) # for plot subtitle
+bin_w1_log <- 0.2
+res1_log <- mosaic::fav_stats(regression_data_tidy$totchg_log)
+hist_plot_totchg_log <-  ggplot(regression_data_tidy, aes(x = totchg_log)) +
+  geom_histogram(binwidth = bin_w1_log, color = "white", fill = "slategray2") + 
+  stat_function( # Plot Normal curve
+    fun = function(x) dnorm(x, mean = res1_log$mean,
+                            sd = res1_log$sd) * 
+      res1_log$n * bin_w1_log,
+    col = "skyblue4", size = 1.5) + 
+  labs(title = "`totchg_log` Distribution",
+       subtitle = paste0(unique_values, " unique values"),
+       x = "log(Total Charge ($))", y = "Count") + 
+  theme_classic() +
+  theme(plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5))
+
+
+hist_plot_totchg + hist_plot_totchg_log
+
+```
+
+
+
+# Tidy Codebook
+
+```{r tidy_codebook}
+
+regression_data_tidy <- regression_data_tidy %>%
+  select(-totchg, hosp_region) %>%
+  select(key_nis, hosp_nis, discwt, nis_stratum, totchg_log, everything())
+
+```
+
+# Analysis
+
+## Split data
+
+
+```{r split_train_test}
+
+set.seed(0)
+
+train_rows <- regression_data_tidy$totchg_log %>%
+  createDataPartition(0.8, list = FALSE, times = 1)
+
+regression_data_train <- regression_data_tidy[train_rows, ]
+regression_data_test <- regression_data_tidy[-train_rows, ]
+
+any(regression_data_test$key_nis %in% regression_data_train$key_nis) # no overlap
+
+saveRDS(regression_data_train, here(data_dir, "regression_data_train.rds"))
+saveRDS(regression_data_test, here(data_dir, "regression_data_test.rds"))
+
+
+```
+
+
+## Develop linear models
+
+
+First, we'll need to create a survey design based on our dataset's strata and weights. 
+
+```{r survey_design}
+
+options(survey.lonely.psu="adjust") # assists with survey design when strata have minimal samples
+
+# remove `key_nis` bc it's no longer needed
+regression_data_train <- regression_data_train[, !(colnames(regression_data_train) == "key_nis")]
+
+# create survey design for linear regression
+design1 <- svydesign(id = ~hosp_nis, 
+                     strata = ~nis_stratum,
+                     weights = ~discwt, 
+                     nest = TRUE,
+                     survey.lonely.psu = "adjust", 
+                     data = regression_data_train)
+
+```
+
+We'll save our summary statistics for each of these variables using the `tbl_svysummary` function from the `gtsummary` package. 
+
+```{r table1_survey}
+
+# remove `key_nis` bc it's no longer needed
+regression_data_tidy <- regression_data_tidy[, !(colnames(regression_data_tidy) == "key_nis")]
+
+# create survey design for summary statistics of complete dataset 
+
+design_all <- svydesign(id = ~hosp_nis, 
+                     strata = ~nis_stratum,
+                     weights = ~discwt, 
+                     nest = TRUE,
+                     survey.lonely.psu = "adjust", 
+                     data = regression_data_tidy)
+
+summary_table1 <- tbl_svysummary(design_all, 
+                                 statistic = list(all_continuous() ~ "{mean} (sd = {sd})", all_categorical() ~ "{n} ({p}%)"))
+
+summary_table1
+
+```
+
+
+### Univariate analysis
+
+Run linear regression with each of our predictor variables as a univariate analysis. 
+
+```{r univariate_glm}
+
+# univariate linear regression with each of our final predictors
+lm1 <- svyglm(totchg_log ~ amonth, design = design1)
+lm1 <- summary(lm1)
+lm2 <- svyglm(totchg_log ~ aweekend, design = design1)
+lm2 <- summary(lm2)
+lm3 <- svyglm(totchg_log ~ elective, design = design1)
+lm3 <- summary(lm3)
+lm4 <- svyglm(totchg_log ~ hosp_division, design = design1)
+lm4 <- summary(lm4)
+lm5 <- svyglm(totchg_log ~ i10_ndx, design = design1)
+lm5 <- summary(lm5)
+lm6 <- svyglm(totchg_log ~ i10_npr, design = design1)
+lm6 <- summary(lm6)
+lm7 <- svyglm(totchg_log ~ pclass_orproc, design = design1)
+lm7 <- summary(lm7)
+lm8 <- svyglm(totchg_log ~ pl_nchs, design = design1)
+lm8 <- summary(lm8)
+lm9 <- svyglm(totchg_log ~ zipinc_qrtl, design = design1)
+lm9 <- summary(lm9)
+lm10 <- svyglm(totchg_log ~ cmr_depress, design = design1)
+lm10 <- summary(lm10)
+lm11 <- svyglm(totchg_log ~ cmr_diab_cx, design = design1)
+lm11 <- summary(lm11)
+lm12 <- svyglm(totchg_log ~ cmr_diab_uncx, design = design1)
+lm12 <- summary(lm12)
+lm13 <- svyglm(totchg_log ~ cmr_drug_abuse, design = design1)
+lm13 <- summary(lm13)
+lm14 <- svyglm(totchg_log ~ cmr_htn_cx, design = design1)
+lm14 <- summary(lm14)
+lm15 <- svyglm(totchg_log ~ cmr_htn_uncx, design = design1)
+lm15 <- summary(lm15)
+lm16 <- svyglm(totchg_log ~ cmr_lung_chronic, design = design1)
+lm16 <- summary(lm16)
+lm17 <- svyglm(totchg_log ~ cmr_obese, design = design1)
+lm17 <- summary(lm17)
+lm18 <- svyglm(totchg_log ~ cmr_thyroid_hypo, design = design1)
+lm18 <- summary(lm18)
+lm19 <- svyglm(totchg_log ~ aprdrg_risk_mortality, design = design1)
+lm19 <- summary(lm19)
+lm20 <- svyglm(totchg_log ~ aprdrg_severity, design = design1)
+lm20 <- summary(lm20)
+lm21 <- svyglm(totchg_log ~ hosp_bedsize, design = design1)
+lm21 <- summary(lm21)
+lm22 <- svyglm(totchg_log ~ hosp_locteach, design = design1)
+lm22 <- summary(lm22)
+lm23 <- svyglm(totchg_log ~ hosp_region, design = design1)
+lm23 <- summary(lm23)
+lm24 <- svyglm(totchg_log ~ n_disc_u, design = design1)
+lm24 <- summary(lm24)
+lm25 <- svyglm(totchg_log ~ n_hosp_u, design = design1)
+lm25 <- summary(lm25)
+lm26 <- svyglm(totchg_log ~ s_disc_u, design = design1)
+lm26 <- summary(lm26)
+lm27 <- svyglm(totchg_log ~ s_hosp_u, design = design1)
+lm27 <- summary(lm27)
+lm28 <- svyglm(totchg_log ~ total_disc, design = design1)
+lm28 <- summary(lm28)
+lm29 <- svyglm(totchg_log ~ ccr_nis, design = design1)
+lm29 <- summary(lm29)
+lm30 <- svyglm(totchg_log ~ wageindex, design = design1)
+lm30 <- summary(lm30)
+lm31 <- svyglm(totchg_log ~ age_cat, design = design1)
+lm31 <- summary(lm31)
+lm32 <- svyglm(totchg_log ~ race_cat, design = design1)
+lm32 <- summary(lm32)
+lm33 <- svyglm(totchg_log ~ payer_cat, design = design1)
+lm33 <- summary(lm33)
+lm34 <- svyglm(totchg_log ~ h_contrl_cat, design = design1)
+lm34 <- summary(lm34)
+lm35 <- svyglm(totchg_log ~ los_cat, design = design1)
+lm35 <- summary(lm35)
+
+
+# combine results
+regression_results <- rbind(lm1$coefficients,
+      lm2$coefficients,
+      lm3$coefficients,
+      lm4$coefficients,
+      lm5$coefficients,
+      lm6$coefficients,
+      lm7$coefficients,
+      lm8$coefficients,
+      lm9$coefficients,
+      lm10$coefficients,
+      lm11$coefficients,
+      lm12$coefficients,
+      lm13$coefficients,
+      lm14$coefficients,
+      lm15$coefficients,
+      lm16$coefficients,
+      lm17$coefficients,
+      lm18$coefficients,
+      lm19$coefficients,
+      lm20$coefficients,
+      lm21$coefficients,
+      lm22$coefficients,
+      lm23$coefficients,
+      lm24$coefficients,
+      lm25$coefficients,
+      lm26$coefficients,
+      lm27$coefficients,
+      lm28$coefficients,
+      lm29$coefficients,
+      lm30$coefficients,
+      lm31$coefficients,
+      lm32$coefficients,
+      lm33$coefficients,
+      lm34$coefficients,
+      lm35$coefficients)
+
+regr_results_clean <- data.frame(regression_results)
+colnames(regr_results_clean) <- c("Estimate", "Std_Error", "t_value", "p_value")
+
+included_regr_results <- regr_results_clean %>%
+  filter(p_value < (0.05/35))
+
+```
+
+
+
+### Multivariate analysis
+
+Now, we'll take only the variables that were significant using a corrected p-value (0.05 / 35) and include them in a multivariate analysis. We'll calculate an r-squared for our model by producing a null model (intercept only, `model_null`), then divide the dispersion parameter from the test model by the dispersion parameter from the null model and subtract that number from 1. 
+
+```{r multi_all_sig}
+
+pred_vars_signif <- c("elective",
+                      "hosp_division",
+                      "i10_ndx",
+                      "i10_npr",
+                      "pclass_orproc",
+                      "pl_nchs",
+                      "zipinc_qrtl",
+                      "cmr_diab_cx",
+                      "cmr_diab_uncx",
+                      "cmr_htn_cx",
+                      "cmr_htn_uncx",
+                      "cmr_lung_chronic",
+                      "cmr_obese",
+                      "cmr_thyroid_hypo",
+                      "aprdrg_risk_mortality",
+                      "aprdrg_severity",
+                      "hosp_bedsize",
+                      "hosp_locteach",
+                      "hosp_region",
+                      "n_disc_u",
+                      "s_disc_u",
+                      "total_disc",
+                      "ccr_nis",
+                      "wageindex",
+                      "age_cat",
+                      "race_cat",
+                      "h_contrl_cat",
+                      "los_cat")
+# regression_data_train_g <- regression_data_train %>% select(c("key_nis","hosp_nis","discwt","nis_stratum","totchg_log",
+#                                                             pred_vars_signif))
+
+model_null <- svyglm(totchg_log ~ 1, design = design1)
+
+model2 <- svyglm(totchg_log ~ elective+
+               hosp_division+
+               i10_ndx+
+               i10_npr+
+               pclass_orproc+
+               pl_nchs+
+               zipinc_qrtl+
+               cmr_diab_cx+
+               cmr_diab_uncx+
+               cmr_htn_cx+
+               cmr_htn_uncx+
+               cmr_lung_chronic+
+               cmr_obese+
+               cmr_thyroid_hypo+
+               aprdrg_risk_mortality+
+               aprdrg_severity+
+               hosp_bedsize+
+               hosp_locteach+
+               hosp_region+
+               n_disc_u+
+               s_disc_u+
+               total_disc+
+               ccr_nis+
+               wageindex+
+               age_cat+
+               race_cat+
+               h_contrl_cat+
+               los_cat, 
+             design = design1)
+
+summary(model2)
+
+model2_disp <- summary(model2)$dispersion[1]
+null_disp <- summary(model_null)$dispersion[1]
+model2_r2 <- 1 - (model2_disp / null_disp)
+
+model2_r2
+
+
+```
+
+Based on the summary of `model2`, we're going to build a model using main effects (no interaction terms) of all the predictors that were found to be significant in `model2`. Again, we will calculate the r-squared using the method described in the above code chunk. 
+
+```{r final_main_effects_model}
+
+
+model3 <- svyglm(totchg_log ~ elective +
+               hosp_division +
+               i10_ndx+
+               i10_npr+
+               pclass_orproc+
+               cmr_diab_cx+
+               aprdrg_risk_mortality+
+               aprdrg_severity+
+               hosp_bedsize+
+               hosp_locteach+
+               ccr_nis+
+               wageindex+
+               age_cat+
+               race_cat+
+               h_contrl_cat+
+               los_cat,
+             design = design1)
+
+summary(model3)
+
+model3_disp <- summary(model3)$dispersion[1]
+null_disp <- summary(model_null)$dispersion[1]
+model3_r2 <- 1 - (model3_disp / null_disp)
+
+model3_r2
+
+```
+
+### Summary of multivariate models
+
+As expected, we had many variables that were significant in univariate analysis. However, many of these lost their signal once we built a multivariate model. This is expected, as many of the variables likely had collinear effects, and once we accounted for multiple predictors, their significance was lost. Our final model, model3, aims to reduce much of this collinearity and only used variables that were significant in `model2`.
+
+Let's compare the differences in r-squared between our two models. 
+
+- The r-square from `model2` is 0.6989. This means that our model accounts for approximately 69.88% of the variation in `totalchg_log`. 
+- The r-square from `model3` is 0.6963. This means that our model accounts for approximately 69.61% of the variation in `totalchg_log`. 
+
+Despite removing many predictors, our third model accounts for nearly the same amount of variation in our result. That's a good sign for using the simpler model going forward. 
+
+### Assess `model3` assumptions in training dataset
+
+Let's check out how `model3` meets the assumptions of a linear model using a few plots. 
+
+```{r model3_assumptions}
+
+par(mfrow = c(2, 2))  
+
+plot(model3)
+
+par(mfrom = c(1, 1))
+
+```
+
+
+### Test final model in testing dataset (pearson correlation, q-q plots)
+
+And finally, let's see how our final model performs in the testing dataset. We'll predict the values for `totchg_log` using the `predict` function and compare the actual vs. predicted values using `geom_point` and `geom_smooth`. 
+
+
+```{r prediction_test}
+
+# create predictions of testing data
+predicted_totchg_log <- data.frame(predict(model3, newdata = regression_data_test, type = "response"))
+
+# compile predicted and actual values for `totchg_log` using the testing dataset
+results_df <- data.frame(Predicted = predicted_totchg_log$response,
+                         Actual = regression_data_test$totchg_log)
+
+# function to extract r-squared to add to ggplot below
+
+get_r2 <- function(x , y) {
+  m <- lm(y ~ x)
+  round(summary(m)$r.squared, 4)
+}
+
+results_r2 <- get_r2(results_df$Actual, results_df$Predicted)
+
+
+g_scatter <- ggplot(results_df, aes(x = Actual, y = Predicted)) + 
+  geom_point() +
+  geom_smooth(method = "lm") + 
+  geom_text(x = 9, y = 12.5, label = paste("r-squared =", results_r2)) + # from get_r2 above
+  labs(x = "Actual - ln(Total Charge)", y = "Predicted - ln(Total Charge)") +
+  theme_bw()
+
+g_scatter
+
+```
+
+
+
+```{r session_info}
+
+sessionInfo()
+
+```

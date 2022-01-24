@@ -1,0 +1,223 @@
+---
+title: "Load and Save SMM Dataset"
+author: "Robert Chen"
+date: "`r Sys.Date()`"
+output:
+  rmdformats::readthedown:
+    highlight: kate
+    number_sections: TRUE
+    code_folding: show
+    code_download: TRUE
+---
+
+# Preliminaries
+
+```{r setup, include=FALSE}
+
+library(knitr); library(rmdformats)
+
+opts_chunk$set(echo=TRUE,
+               cache=FALSE,
+               prompt=FALSE,
+               tidy=FALSE,
+               comment=NA,
+               message=FALSE,
+               warning=FALSE)
+opts_knit$set(width=75)
+
+```
+
+  
+## Resources
+  The following resources will be very helpful:\
+* [RMarkdown Tutorial](https://ourcodingclub.github.io/tutorials/rmarkdown/)
+* [ICD-10 codes in R](https://www.r-bloggers.com/2019/05/whats-that-disease-called-overview-of-icd-package/)
+* [Parallelization in R](https://nceas.github.io/oss-lessons/parallel-computing-in-r/parallel-computing-in-r.html)
+* [Future: a tutorial on parallelization in R using the futures framework](https://cran.r-project.org/web/packages/future/vignettes/future-1-overview.html)
+* [Sparse matrices in R using the Matrix library](https://slowkow.com/notes/sparse-matrix/)
+* [Analyzing survey data in R](https://stats.oarc.ucla.edu/r/seminars/survey-data-analysis-with-r/)
+* [Using svyglm instead of lme4 for linear modeling](https://stats.stackexchange.com/questions/89204/fitting-multilevel-models-to-complex-survey-data-in-r)
+* [Generalized linear models on survey data](https://stats.oarc.ucla.edu/r/faq/how-can-i-do-regression-estimation-with-survey-data/)
+* [Using the srvyr package to add tidyverse to surveys](https://cran.r-project.org/web/packages/srvyr/vignettes/srvyr-vs-survey.html)
+* [Textbook on complex survey designs in R](http://r-survey.r-forge.r-project.org/svybook/)
+
+## Loading packages
+
+First, we need to load packages that are useful for the analysis of HCUP NIS data.\
+We will be primarily data wrangling using the `tidyverse` suite of packages.\
+We will be using `rmarkdown` as our primary method of notebooking.\
+We will also be using the package `survey` to deal with the sampling design of the NIS.\
+Finally, we will be loading a series of statistical packages for complex-design analyses\
+
+
+```{r load_packages, warning = FALSE, message = FALSE}
+
+# suppressPackageStartupMessages(library(rmarkdown))
+# suppressPackageStartupMessages(library(survey))
+# suppressPackageStartupMessages(library(yarrr))
+# suppressPackageStartupMessages(library(lme4))
+# suppressPackageStartupMessages(library(lmerTest))
+# suppressPackageStartupMessages(library(icd))
+# suppressPackageStartupMessages(library(Matrix))
+# suppressPackageStartupMessages(library(future))
+# suppressPackageStartupMessages(library(future.apply))
+# suppressPackageStartupMessages(library(parallel))
+# suppressPackageStartupMessages(library(srvyr))
+# suppressPackageStartupMessages(library(missForest))
+# suppressPackageStartupMessages(library(tidyverse))
+
+library(here); library(yarrr); library(survey)
+library(lme4); library(lmerTest); library(icd)
+library(Matrix); library(future); library(future.apply)
+library(parallel); library(srvyr); library(tidyverse)
+
+
+```
+
+# Load and merge data
+
+We will now load the HCUP NIS dataset from 2019 just to understand features of the dataset.\
+Although we have data from 2016-2019, loading one year's worth of data will reduce memory requirements.\
+Each year has several useful files worth nothing:\
+* Core file: Main file containing main features including age, payer, discharge status, ICD-10 code, total charges.\
+* Severity file: Additional data identifying the severity of a condition for a specific discharge.\
+* Diagnosis and procedure groups file: Additional file describing ICD-10 comorbidity information and procedures.\
+* Hospital file: Contains information about hospital data.\
+
+```{r load_merge}
+###### 1. Loading data from the HCUP NIS
+### i. Set up a working data directory
+
+data_dir <- "data"
+
+### ii. Load data files for 2019
+core_2019 <- read.csv(here(data_dir, "NIS_2019_Core.csv"))
+hospital_2019 <- read.csv(here(data_dir, "NIS_2019_Hospital.csv"))
+severity_2019 <- read.csv(here(data_dir, "NIS_2019_Severity.csv"))
+cc_2019 <- read.csv(here(data_dir, "cc2019NIS.csv"))
+dx_pr_grps_2019 <- read.csv(here(data_dir, "NIS_2019_DX_PR_GRPS.csv"))
+
+### iii. Merge dx_pr_grps_2019 with core_2019
+all.equal(dx_pr_grps_2019$key_nis, core_2019$key_nis)
+all.equal(severity_2019$key_nis, core_2019$key_nis)
+core_2019 <- cbind(core_2019, dx_pr_grps_2019[, 4:ncol(dx_pr_grps_2019)], severity_2019[, 3:ncol(severity_2019)])
+core_2019 <- as.data.frame(core_2019)
+
+###### 2. Importing files to filter for severe maternal morbidity
+smm_dx_cdc <- read.table(here(data_dir, "220119_smm_dx_cdc.txt"), sep = "")
+smm_pcs <- read.table(here(data_dir, "smm_pcs.txt"), sep = "")
+pcs_transfusion <- read.table(here(data_dir, "220119_pcs_transfusion.txt"), sep = "")
+
+###### 3. Importing variables that we care about
+# variables_complete <- read.table(here(data_dir, "all_variables_of_interest.txt"), sep = "")
+variables_core <- read.table(here(data_dir, "core_variables_of_interest.txt"), sep = "") %>% unlist
+
+### i. Clean up core variables
+names(variables_core) <- NULL
+### ii. Extract cmr variable names
+other_columns <- colnames(core_2019)[grepl('^cmr_', colnames(core_2019))]
+### iii. Append
+variables_core <- c(variables_core, other_columns, c("aprdrg_risk_mortality", "aprdrg_severity"))
+
+```
+
+## Creating a delivery dataset
+
+```{r delivery_filter}
+###### 1. Subsetting the data to only deliveries
+core_2019_subset <- core_2019[, variables_core]
+deliv_2019 <- subset(core_2019_subset, i10_delivery == 1)
+
+
+###### 2. Add hospital data columns
+match1 <- hospital_2019[match(deliv_2019$hosp_nis, hospital_2019$hosp_nis), c(5,2,3,4,6,7,9,10,11,12,13)]
+all.equal(deliv_2019$hosp_nis, match1$hosp_nis) # TRUE
+match1$hosp_nis <- NULL
+deliv_2019 <- cbind(deliv_2019, match1)
+remove(match1)
+
+###### 3. Add cost-to-charge ratios
+match1 <- cc_2019[match(deliv_2019$hosp_nis, cc_2019$hosp_nis), c(1,3,4)]
+all.equal(deliv_2019$hosp_nis, match1$hosp_nis) # TRUE
+match1$hosp_nis <- NULL
+deliv_2019 <- cbind(deliv_2019, match1)
+remove(match1)
+
+###### 4. Check the percentage of missing datapoints there are
+apply(deliv_2019, 2, function(x){sum(is.na(x))/length(x)}) %>% unlist()
+
+###### 5. Mutate columns that need to be factors
+apply(deliv_2019, 2, function(x){is.numeric(x)})
+### i. Update all factors
+non_factors <- c('age', 'discwt', 'i10_ndx', 'i10_npr', 'los', 'totchg', 'n_disc_u', 'n_hosp_u', 's_disc_u', 's_hosp_u', 'total_disc', 'ccr_nis', 'wageindex')
+for(i in 1:ncol(deliv_2019)){
+  current_colname <- colnames(deliv_2019[i])
+  if(current_colname %in% non_factors){
+    next
+  } else{
+    deliv_2019[, current_colname] <- as.factor(deliv_2019[, current_colname])
+  }
+}
+
+# ###### 6. Create a survey design for deliveries
+# svy_deliv <- svydesign(id = ~hosp_nis,
+#                        strata = ~nis_stratum,
+#                        weights = ~discwt,
+#                        nest = TRUE,
+#                        survey.lonely.psu = "adjust",
+#                        data = deliv_2019)
+```
+
+## Creating a SMM dataset
+
+SMM is defined as any delivery that has a medical diagnosis code of SMM, has a transfusion procedure code, or a procedure code associated with SMM excluding transfusions.\
+These are nicely summarized in three files that Clara Kao put together.
+
+```{r smm_filter}
+###### 1. Creating a smaller dataset of icd codes only
+### i. Subset a dataset that only has icd codes and procedure codes
+deliv_icd <- subset(core_2019, i10_delivery == 1)
+deliv_icd <- deliv_icd[, grepl('^i10_dx|i10_pr', colnames(deliv_icd))]
+### ii. Identify the unique icd codes
+unique_codes <- unique(
+  unlist(
+    apply(deliv_icd, 2, function(x){
+    temp <- unique(x)
+    temp <- temp[temp != ""]
+    }
+    )
+  )
+)
+length(unique_codes) # 10614 unique ICD or procedure codes
+### iii. Set up the universe of codes to search against
+smm_related_codes <- c(unlist(smm_dx_cdc), unlist(smm_pcs), unlist(pcs_transfusion))
+names(smm_related_codes) <- NULL
+# Set up multisession parameters to 'parallelize' in RStudio
+plan(multisession, workers = availableCores(), gc = TRUE)
+options(future.globals.maxSize = 16000 * 1024 ^ 2)
+# Use future_lapply to go through and create a TRUE/FALSE boolean list matching to each row and whether the icd or procedure codes appear in the universe of SMM-defined codes
+
+temp1 <- future.apply::future_lapply(1:nrow(deliv_icd), function(x){
+  current_icd_codes <- unlist(deliv_icd[x, ])
+  current_icd_codes <- current_icd_codes[current_icd_codes != ""]
+  if(length(current_icd_codes) == 0){
+    break
+  } else{
+    sum(current_icd_codes %in% smm_related_codes) > 0
+  }
+}) 
+
+temp1 <- unlist(temp1) 
+
+###### 2. Creating an SMM-specific dataset
+### i. Exclude NAs or any transfers in or out of the hospital during admission
+smm_2019 <- subset(deliv_2019, temp1)
+smm_2019 <- subset(smm_2019, !is.na(tran_in))
+smm_2019 <- subset(smm_2019, tran_in == 0)
+smm_2019 <- subset(smm_2019, !is.na(tran_out))
+smm_2019 <- subset(smm_2019, tran_out == 0)
+
+smm_2019 <- smm_2019 %>% select(-c("hosp_division.1")) # quick fix to a duplicated column
+
+saveRDS(smm_2019, here(data_dir, "regression_data_smm_nonimputed.rds"))
+```
